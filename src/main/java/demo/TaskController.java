@@ -1,14 +1,22 @@
 package demo;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.headers.Header;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.io.InputStreamResource;
+import org.springframework.core.io.Resource;
 import org.springframework.hateoas.server.mvc.WebMvcLinkBuilder;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -27,12 +35,13 @@ import org.springframework.web.bind.annotation.RestController;
 import javax.validation.Valid;
 import javax.validation.ValidationException;
 import javax.validation.Validator;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.lang.reflect.Field;
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @RestController
@@ -53,28 +62,115 @@ public class TaskController {
             @ApiResponse(responseCode = "204", description = "No tasks found")
     })
     @GetMapping
-    public ResponseEntity<List<Object>> getTasks (@RequestParam(required = false) String title,
-                                                     @RequestParam(required = false) String description,
-                                                     @RequestParam(required = false) String assignedTo,
-                                                     @RequestParam(required = false) TaskModel.TaskStatus status,
-                                                     @RequestParam(required = false) TaskModel.TaskSeverity severity,
-                                                     @RequestHeader(required = false, name="X-Fields") String fields,
-                                                     @RequestHeader(required = false, name="X-Sort") String sort) {
+    public ResponseEntity<List<Map<String,Object>>> getTasks (@RequestParam(required = false) String title,
+                                                  @RequestParam(required = false) String description,
+                                                  @RequestParam(required = false) String assignedTo,
+                                                  @RequestParam(required = false) TaskModel.TaskStatus status,
+                                                  @RequestParam(required = false) TaskModel.TaskSeverity severity,
+                                                  @RequestHeader(required = false, name="X-Fields") String fields,
+                                                  @RequestHeader(required = false, name="X-Sort") String sort) {
         List<TaskModel> tasks = service.getTasks(title, description, assignedTo, status, severity);
         if(tasks.isEmpty()) {
             return ResponseEntity.noContent().build();
         } else {
-            if(sort != null && !sort.isBlank()) {
-                tasks = tasks.stream().sorted((first, second) -> BaseModel.sorter(sort).compare(first, second)).collect(Collectors.toList());
-            }
-            List<Object> items;
-            if(fields != null && !fields.isBlank()) {
-                items = tasks.stream().map(task -> task.sparseFields(fields.split(","))).collect(Collectors.toList());
-            } else {
-                items = new ArrayList<>(tasks);
-            }
-            return ResponseEntity.ok(items);
+
+            return ResponseEntity.ok(getFilteredTasks(fields, sort, tasks));
         }
+    }
+    @Operation(summary = "Export tasks ", operationId = "exportTasks")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Tasks in csv format",
+                    content = {@Content(mediaType = MediaType.TEXT_PLAIN_VALUE,
+                            schema = @Schema(implementation = Object.class))}
+            ),
+            @ApiResponse(responseCode = "200", description = "Tasks in xml format",
+                    content = {@Content(mediaType = MediaType.APPLICATION_XML_VALUE,
+                            schema = @Schema(implementation = Object.class))}
+            )
+    })
+    @GetMapping("/export")
+    public ResponseEntity<Resource> exportTasks (@RequestParam(required = false) String title,
+                                                 @RequestParam(required = false) String description,
+                                                 @RequestParam(required = false) String assignedTo,
+                                                 @RequestParam(required = false) TaskModel.TaskStatus status,
+                                                 @RequestParam(required = false) TaskModel.TaskSeverity severity,
+                                                 @RequestHeader(required = false, name="Fields") String fields,
+                                                 @RequestHeader(required = false, name="Sort") String sort,
+                                                 @RequestHeader(required = false) String format) throws JsonProcessingException {
+        if(format == null || !format.equals("xml")){
+            format = "xml";
+        }
+
+
+        List<TaskModel> tasks = service.getTasks(title, description, assignedTo, status, severity);
+        var items = getFilteredTasks(fields, sort, tasks);
+        return getFormated(items,format);
+
+    }
+
+    private ResponseEntity<Resource> getFormated(List<Map<String, Object>> items, String format) throws JsonProcessingException {
+        ByteArrayInputStream byteArrayOutputStream = format.equals("csv") ? getCsv(items) : getXml(items);
+
+
+        InputStreamResource fileInputStream = new InputStreamResource(byteArrayOutputStream);
+
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=tasks." + format);
+        headers.set(HttpHeaders.CONTENT_TYPE, "text/" + format);
+        return new ResponseEntity<>(
+                fileInputStream,
+                headers,
+                HttpStatus.OK
+        );
+    }
+
+    private List<Map<String,Object>> getFilteredTasks(@RequestHeader(required = false, name = "Fields") String fields, @RequestHeader(required = false, name = "Sort") String sort, List<TaskModel> tasks) {
+        if(sort != null && !sort.isBlank()) {
+            tasks = tasks.stream().sorted((first, second) -> BaseModel.sorter(sort).compare(first, second)).collect(Collectors.toList());
+        }
+        List<Map<String,Object>> items;
+        if(fields == null || fields.isBlank()) {
+
+            fields = Arrays.stream(TaskModel.class.getDeclaredFields()).map(Field::getName).collect(Collectors.joining(","));
+        }
+        String finalFields = fields;
+        items = tasks.stream().map(task -> task.sparseFields(finalFields.split(","))).collect(Collectors.toList());
+
+        return items;
+    }
+
+    private ByteArrayInputStream getCsv(List<Map<String,Object>> items) {
+        ByteArrayInputStream byteArrayOutputStream;
+        try (
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                // defining the CSV printer
+                CSVPrinter csvPrinter = new CSVPrinter(
+                        new PrintWriter(out),
+
+                        CSVFormat.DEFAULT
+
+                );
+        ) {
+            // populating the CSV content
+            for (var record : items)
+                csvPrinter.printRecord(record.values());
+
+            // writing the underlying stream
+            csvPrinter.flush();
+
+            return new ByteArrayInputStream(out.toByteArray());
+        } catch (IOException e) {
+            throw new RuntimeException(e.getMessage());
+        }
+
+
+    }
+
+    private ByteArrayInputStream getXml(List<Map<String,Object>> items) throws JsonProcessingException {
+        XmlMapper xmlMapper = new XmlMapper();
+        var data = xmlMapper.writeValueAsBytes(items);
+        return new ByteArrayInputStream(data);
     }
 
 
